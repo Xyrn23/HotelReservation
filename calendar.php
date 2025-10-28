@@ -1,90 +1,104 @@
 <?php
 include 'includes/db.php';
 
-// Get selected month/year (default: current)
 $year = $_GET['year'] ?? date('Y');
 $month = $_GET['month'] ?? date('m');
 $daysInMonth = date('t', mktime(0, 0, 0, $month, 1, $year));
-
-// Fetch all bookings for this month
-$stmt = $db->prepare("
-    SELECT room_category, room_number, check_in_date 
-    FROM reservations 
-    WHERE full_name != 'AVAILABLE' 
-      AND strftime('%Y-%m', check_in_date) = ?
-");
-$stmt->execute(["$year-$month"]);
-$bookings = $stmt->fetchAll(PDO::FETCH_GROUP | PDO::FETCH_ASSOC);
-
-// Room categories and total rooms per category (5 each)
 $categories = ['deluxe', 'economy', 'regular', 'vip'];
-$totalRoomsPerCategory = 5;
+
+// Get all rooms and group them by category
+$allRooms = [];
+$roomsResult = $db->query("SELECT id, room_number, category FROM rooms ORDER BY category, room_number");
+while ($row = $roomsResult->fetch(PDO::FETCH_ASSOC)) {
+    $allRooms[$row['category']][] = $row;
+}
+
+// Get all bookings that span this month
+$stmt = $db->prepare("
+    SELECT b.check_in_date, b.check_out_date, r.room_number, r.category
+    FROM bookings b
+    JOIN rooms r ON r.id = b.room_id
+    WHERE (strftime('%Y-%m', b.check_in_date) <= ? AND strftime('%Y-%m', b.check_out_date) >= ?)
+       OR (strftime('%Y-%m', b.check_in_date) = ?)
+       OR (strftime('%Y-%m', b.check_out_date) = ?)
+");
+$stmt->execute(["$year-$month", "$year-$month", "$year-$month", "$year-$month"]);
+$bookedRanges = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Convert ranges to daily bookings for the calendar
+$bookedRooms = [];
+foreach ($bookedRanges as $range) {
+    $currentDate = $range['check_in_date'];
+    while ($currentDate < $range['check_out_date']) { // < not <= because check_out is exclusive
+        $bookedRooms[$currentDate][] = $range;
+        $currentDate = date('Y-m-d', strtotime($currentDate . ' +1 day'));
+    }
+}
 ?>
 
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Availability Calendar</title>
-    <link rel="stylesheet" href="assets/css/style.css">
-</head>
-<body>
-    <?php include 'includes/header.php'; ?>
+<?php $pageTitle = "Room Availability"; include 'includes/header.php'; ?>
 
-    <main class="calendar-container">
-        <div class="calendar-controls">
-            <a href="?year=<?= $year ?>&month=<?= str_pad($month - 1, 2, '0', STR_PAD_LEFT) ?>" 
-               <?= $month == 1 ? 'style="visibility:hidden"' : '' ?>>&laquo; Prev</a>
-            <h2><?= date('F Y', mktime(0, 0, 0, $month, 1, $year)) ?></h2>
-            <a href="?year=<?= $year ?>&month=<?= str_pad($month + 1, 2, '0', STR_PAD_LEFT) ?>"
-               <?= $month == 12 ? 'style="visibility:hidden"' : '' ?>>Next &raquo;</a>
-        </div>
+<div class="calendar-container">
+    <div class="calendar-controls">
+        <a href="?year=<?= $year ?>&month=<?= str_pad($month - 1, 2, '0', STR_PAD_LEFT) ?>" 
+           <?= $month == 1 ? 'style="visibility:hidden"' : '' ?>>&laquo; Prev</a>
+        <h2><?= date('F Y', mktime(0, 0, 0, $month, 1, $year)) ?></h2>
+        <a href="?year=<?= $year ?>&month=<?= str_pad($month + 1, 2, '0', STR_PAD_LEFT) ?>"
+           <?= $month == 12 ? 'style="visibility:hidden"' : '' ?>>Next &raquo;</a>
+    </div>
 
-        <div class="calendar-grid">
-            <?php
-            // Weekday headers
-            $weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-            foreach ($weekdays as $wd) echo "<div class='weekday'>$wd</div>";
+    <div class="calendar-grid">
+        <?php
+        $weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        foreach ($weekdays as $wd) echo "<div class='weekday'>$wd</div>";
 
-            // Empty cells before 1st day
-            $firstDay = date('w', mktime(0, 0, 0, $month, 1, $year));
-            for ($i = 0; $i < $firstDay; $i++) {
-                echo "<div class='empty'></div>";
-            }
+        $firstDay = date('w', mktime(0, 0, 0, $month, 1, $year));
+        for ($i = 0; $i < $firstDay; $i++) echo "<div class='empty'></div>";
 
-            // Days of the month
-            for ($day = 1; $day <= $daysInMonth; $day++) {
-                $dateStr = "$year-$month-" . str_pad($day, 2, '0', STR_PAD_LEFT);
-                $dayBookings = [];
+        for ($day = 1; $day <= $daysInMonth; $day++) {
+            $dateStr = "$year-$month-" . str_pad($day, 2, '0', STR_PAD_LEFT);
+            echo "<div class='calendar-day'>";
+            echo "<strong>$day</strong>";
 
-                // Count booked rooms per category on this date
-                if (isset($bookings[$dateStr])) {
-                    foreach ($bookings[$dateStr] as $b) {
-                        $dayBookings[$b['room_category']] = ($dayBookings[$b['room_category']] ?? 0) + 1;
+            foreach ($categories as $cat) {
+                $allNums = array_column($allRooms[$cat] ?? [], 'room_number');
+                
+                // Get booked rooms for THIS date AND THIS category
+                $bookedNums = [];
+                if (isset($bookedRooms[$dateStr])) {
+                    foreach ($bookedRooms[$dateStr] as $b) {
+                        if ($b['category'] === $cat) {
+                            $bookedNums[] = $b['room_number'];
+                        }
                     }
                 }
+                
+                $availableNums = array_diff($allNums, $bookedNums);
+                $availableCount = count($availableNums);
+                $bookedCount = count($bookedNums);
 
-                echo "<div class='calendar-day'>";
-                echo "<strong>$day</strong>";
-
-                // Show availability per category
-                foreach ($categories as $cat) {
-                    $booked = $dayBookings[$cat] ?? 0;
-                    $available = $totalRoomsPerCategory - $booked;
-                    $color = $available == 0 ? 'booked' : ($available <= 2 ? 'limited' : 'available');
-                    echo "<div class='room-status $color' title=''>$available $cat</div>";
+                if ($bookedCount === 0) {
+                    // No rooms booked - show available count
+                    echo "<div class='room-status available'>$cat: all $availableCount available</div>";
+                } elseif ($availableCount === 0) {
+                    // All rooms booked - show "fully booked"
+                    echo "<div class='room-status booked'>$cat: fully booked</div>";
+                } else {
+                    // Some rooms booked - show which ones are booked
+                    $bookedList = implode(', #', $bookedNums);
+                    echo "<div class='room-status limited'>$cat: #{$bookedList} booked</div>";
                 }
-                echo "</div>";
             }
-            ?>
-        </div>
+            echo "</div>";
+        }
+        ?>
+    </div>
 
-        <div class="legend">
-            <span class="available">● Available (3–5)</span>
-            <span class="limited">● Limited (1–2)</span>
-            <span class="booked">● Fully Booked</span>
-        </div>
-    </main>
-    <!-- Add before </body> in all PHP files -->
-<script src="assets/js/main.js"></script>
-</body>
-</html>
+    <div class="legend">
+        <span class="available">● All rooms available</span>
+        <span class="limited">● Some rooms booked (shows which)</span>
+        <span class="booked">● Fully booked</span>
+    </div>
+</div>
+
+<?php include 'includes/footer.php'; ?>
